@@ -3,6 +3,7 @@ import time
 from typing import Optional
 from src import CheckpointManager
 import torch
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -18,7 +19,10 @@ def train(
     checkpoint_manager: CheckpointManager = None,
     resume_from: str = None,
     device: Optional[torch.device] = None,
-    val_dataset = None
+    val_dataset=None,
+    scheduler=None,
+    lr_decay_start_epoch=15,
+    lr_decay_factor=0.5,
 ):
     """
     Train the ECG encoder with contrastive learning.
@@ -35,6 +39,9 @@ def train(
         resume_from: Path to checkpoint to resume training from
         device: Torch device to run training on (auto-selected if None)
         val_dataset: Optional validation dataset for evaluation after each epoch
+        scheduler: Optional LR scheduler (defaults to decay after `lr_decay_start_epoch`)
+        lr_decay_start_epoch: Epoch index at which the default scheduler lowers the LR
+        lr_decay_factor: Multiplicative factor applied after the decay epoch
     """
     if device is None:
         if torch.cuda.is_available():
@@ -48,6 +55,11 @@ def train(
     start_epoch = 0
     loss_history = []
     val_loss_history = []
+    if scheduler is None:
+        scheduler = LambdaLR(
+            optimizer,
+            lambda epoch: lr_decay_factor ** (epoch // lr_decay_start_epoch),
+        )
     
     # Resume from checkpoint if specified
     if resume_from:
@@ -59,15 +71,17 @@ def train(
         start_epoch = checkpoint['epoch']
         loss_history = checkpoint.get('loss_history', [])
         val_loss_history = checkpoint.get('val_loss_history', [])
+        scheduler_state = checkpoint.get('scheduler_state_dict')
+        if scheduler is not None and scheduler_state is not None:
+            scheduler.load_state_dict(scheduler_state)
         print(f"Resuming training from epoch {start_epoch + 1}")
     
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False,)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True) if val_dataset else None
     
     training_start_time = time.time()
 
     for epoch in range(start_epoch, start_epoch + epochs):
-        # Training phase
         model.train()
         epoch_start_time = time.time()
         total_loss = 0.0
@@ -83,11 +97,8 @@ def train(
             _, proj1 = model(aug1)
             _, proj2 = model(aug2)
 
-            embeddings = torch.cat((proj1, proj2), dim=0)
-            indices = torch.arange(0, proj1.size(0), device=device)
-            labels = torch.cat((indices, indices), dim=0)
 
-            loss = loss_fn(embeddings, labels)
+            loss = loss_fn(proj1, proj2)
             loss.backward()
             
             # Calculate gradient norm
@@ -126,11 +137,7 @@ def train(
                     _, proj1 = model(aug1)
                     _, proj2 = model(aug2)
 
-                    embeddings = torch.cat((proj1, proj2), dim=0)
-                    indices = torch.arange(0, proj1.size(0), device=device)
-                    labels = torch.cat((indices, indices), dim=0)
-
-                    loss = loss_fn(embeddings, labels)
+                    loss = loss_fn(proj1, proj2)
                     val_total_loss += loss.item()
                     
                     val_progress_bar.set_postfix({'val_loss': f'{loss.item():.4f}'})
@@ -141,7 +148,8 @@ def train(
         # Print epoch summary
         summary = (f"Epoch [{epoch + 1}/{start_epoch + epochs}] "
                   f"Train Loss: {avg_loss:.4f} | "
-                  f"Grad Norm: {avg_grad_norm:.2f} | ")
+                  f"Grad Norm: {avg_grad_norm:.2f} | "
+                  f"LR: {optimizer.param_groups[0]['lr']:.6f} | ")
         if val_loss is not None:
             summary += f"Val Loss: {val_loss:.4f} | "
         summary += f"Time: {epoch_time:.1f}s | Total: {total_time:.1f}s"
@@ -158,7 +166,8 @@ def train(
             if val_loss is not None:
                 additional_info['val_loss_history'] = val_loss_history
                 additional_info['val_loss'] = val_loss
-            
+            if scheduler is not None:
+                additional_info['scheduler_state_dict'] = scheduler.state_dict()
             checkpoint_manager.save_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -167,7 +176,9 @@ def train(
                 config=config,
                 additional_info=additional_info
             )
-    
+        if scheduler is not None:
+            scheduler.step()
+
     total_time = time.time() - training_start_time
     print(f"\nTraining completed in {total_time:.1f}s ({total_time/60:.1f} minutes)")
     

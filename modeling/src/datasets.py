@@ -1,157 +1,127 @@
-from typing import Tuple
+"""
+ECG Dataset classes for contrastive learning and downstream tasks.
+
+Provides memory-efficient datasets that load data from disk on-demand
+using memory-mapped numpy arrays.
+"""
+
+from pathlib import Path
+from typing import Tuple, Union
 
 import numpy as np
 import torch
-from src import DualAugmenter
 
-def _compute_channel_stats(data: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute dataset-level per-channel mean and std with numerical stability."""
-    if data.shape[0] == 0:
-        raise ValueError("Cannot compute normalization statistics on an empty dataset.")
-    means = np.mean(data, axis=(0, 1), dtype=np.float64)
-    stds = np.std(data, axis=(0, 1), dtype=np.float64)
-    stds = np.maximum(stds, eps)
-    return means.astype(np.float32), stds.astype(np.float32)
+from src.augmentor import DualAugmenter
 
 
 class ECGContrastiveTrainDataset(torch.utils.data.Dataset):
     """
-    ECG dataset for contrastive learning using DualAugmenter.
+    ECG dataset for contrastive learning that loads paired segments from disk.
 
-    Applies dataset-level per-channel Z-score normalization before augmentation.
-    Ensures that the two augmented views are guaranteed to be different.
+    Loads segment pairs on-demand from memory-mapped .npy files for memory efficiency.
+    Each pair (segment_a[i], segment_b[i]) represents two 5s segments from the same
+    10s ECG recording, forming a natural positive pair for contrastive learning.
+
+    Augmentations are applied to both segments using DualAugmenter.
+    Data is already normalized during preprocessing (per-sample per-channel z-score).
 
     Args:
-        X: Input signals of shape (num_samples, time_steps, num_channels)
-        y: Labels (used for filtering valid samples)
-        dual_augmenter: DualAugmenter instance
-        channel_means: Optional per-channel means to reuse instead of recomputing
-        channel_stds: Optional per-channel stds to reuse instead of recomputing
-        normalization_eps: Small constant added to stds to avoid divide-by-zero
+        segment_a_path: Path to .npy file containing first segments (N, 2500, 12)
+        segment_b_path: Path to .npy file containing second segments (N, 2500, 12)
+        labels_path: Path to .npy file containing integer labels (N,)
+        dual_augmenter: DualAugmenter instance for generating augmented views
+        device: Device to place tensors on
     """
 
     def __init__(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
+        segment_a_path: Union[str, Path],
+        segment_b_path: Union[str, Path],
+        labels_path: Union[str, Path],
         dual_augmenter: DualAugmenter,
-        channel_means: np.ndarray = None,
-        channel_stds: np.ndarray = None,
-        normalization_eps: float = 1e-8,
+        device: torch.device = torch.device("cpu"),
     ) -> None:
-        self.X = X
-        self.y = y
+        self.segment_a = np.load(segment_a_path, mmap_mode="r") # mmap_mode = r should make the loading lazy,
+        # to avoid memory cluttering
+        self.segment_b = np.load(segment_b_path, mmap_mode="r")
+        self.labels = np.load(labels_path, mmap_mode="r")
         self.dual_augmenter = dual_augmenter
-        self._num_channels = self.X.shape[2]
-        self.normalization_eps = normalization_eps
+        self.device = device
 
-        if (channel_means is None) != (channel_stds is None):
-            raise ValueError("channel_means and channel_stds must both be provided or both be None.")
-
-        if channel_means is None:
-            # Compute dataset-level statistics once per dataset
-            computed_means, computed_stds = _compute_channel_stats(self.X, self.normalization_eps)
-            self.channel_means = computed_means
-            self.channel_stds = computed_stds
-        else:
-            self.channel_means = np.asarray(channel_means, dtype=np.float32)
-            self.channel_stds = np.asarray(channel_stds, dtype=np.float32)
-
-        if self.channel_means.shape != (self._num_channels,):
-            raise ValueError(
-                f"channel_means must have shape ({self._num_channels},), got {self.channel_means.shape}"
-            )
-        if self.channel_stds.shape != (self._num_channels,):
-            raise ValueError(
-                f"channel_stds must have shape ({self._num_channels},), got {self.channel_stds.shape}"
-            )
-        self.channel_stds = np.maximum(self.channel_stds, self.normalization_eps)
+        assert len(self.segment_a) == len(self.segment_b) == len(self.labels), (
+            f"Mismatched lengths: segment_a={len(self.segment_a)}, "
+            f"segment_b={len(self.segment_b)}, labels={len(self.labels)}"
+        )
 
     def __len__(self) -> int:
-        return len(self.X)
+        return len(self.labels)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Get signal and normalize
-        signal = self.X[idx, :, :].astype(np.float32)  # (time_steps, num_channels)
-        signal = (signal - self.channel_means) / self.channel_stds
+        # Convert mmap data to tensors (this creates a copy, avoiding read-only issues)
+        seg_a = torch.from_numpy(np.array(self.segment_a[idx])).float()
+        seg_b = torch.from_numpy(np.array(self.segment_b[idx])).float()
 
-        # Use dual augmenter to get two diverse augmented views
-        aug1, aug2 = self.dual_augmenter(ecg=signal)
+        # Apply augmentations to both segments
+        # seg_a and seg_b are natural positive pairs from the same ECG
+        aug_a, aug_b = self.dual_augmenter(ecg1=seg_a, ecg2=seg_b)
 
-        aug1_tensor = torch.tensor(aug1, dtype=torch.float32)
-        aug2_tensor = torch.tensor(aug2, dtype=torch.float32)
-
-        return aug1_tensor, aug2_tensor
+        return aug_a, aug_b
 
 
 class ECGDataset(torch.utils.data.Dataset):
     """
-    ECG dataset for downstream tasks (classification, clustering, etc).
+    ECG dataset for downstream tasks that loads segments from disk.
 
-    Applies dataset-level per-channel Z-score normalization.
-    Returns single signals with their labels for supervised or semi-supervised tasks.
+    Combines both segment files into a single dataset where each segment
+    is treated as an independent sample. This doubles the effective dataset size.
 
-    Assumes labels are already mapped to integers.
+    For N original ECG recordings:
+    - Indices 0 to N-1 correspond to segment_a samples
+    - Indices N to 2N-1 correspond to segment_b samples
+
+    Data is already normalized during preprocessing (per-sample per-channel z-score).
 
     Args:
-        X: Input signals of shape (num_samples, time_steps, num_channels)
-        y: Integer labels for each signal
-        channel_means: Optional per-channel means to reuse instead of recomputing
-        channel_stds: Optional per-channel stds to reuse instead of recomputing
-        normalization_eps: Small constant added to stds to avoid divide-by-zero
+        segment_a_path: Path to .npy file containing first segments (N, 2500, 12)
+        segment_b_path: Path to .npy file containing second segments (N, 2500, 12)
+        labels_path: Path to .npy file containing integer labels (N,)
     """
 
     def __init__(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
-        channel_means: np.ndarray = None,
-        channel_stds: np.ndarray = None,
-        normalization_eps: float = 1e-8,
+        segment_a_path: Union[str, Path],
+        segment_b_path: Union[str, Path],
+        labels_path: Union[str, Path],
     ) -> None:
-        self.X = X
-        self.y = y.values if hasattr(y, "values") else np.array(y)
+        self.segment_a = np.load(segment_a_path, mmap_mode="r")
+        self.segment_b = np.load(segment_b_path, mmap_mode="r")
+        self.labels = np.load(labels_path, mmap_mode="r")
 
-        # Ensure labels are integers
-        if not np.issubdtype(self.y.dtype, np.integer):
-            raise TypeError(f"Labels must be integers, got {self.y.dtype}")
+        assert len(self.segment_a) == len(self.segment_b) == len(self.labels), (
+            f"Mismatched lengths: segment_a={len(self.segment_a)}, "
+            f"segment_b={len(self.segment_b)}, labels={len(self.labels)}"
+        )
 
-        # Calculate number of classes
-        self.num_classes = int(np.max(self.y)) + 1
-
-        self._num_channels = self.X.shape[2]
-        self.normalization_eps = normalization_eps
-
-        if (channel_means is None) != (channel_stds is None):
-            raise ValueError("channel_means and channel_stds must both be provided or both be None.")
-
-        if channel_means is None:
-            # Compute dataset-level statistics once per dataset
-            computed_means, computed_stds = _compute_channel_stats(self.X, self.normalization_eps)
-            self.channel_means = computed_means
-            self.channel_stds = computed_stds
-        else:
-            self.channel_means = np.asarray(channel_means, dtype=np.float32)
-            self.channel_stds = np.asarray(channel_stds, dtype=np.float32)
-
-        if self.channel_means.shape != (self._num_channels,):
-            raise ValueError(
-                f"channel_means must have shape ({self._num_channels},), got {self.channel_means.shape}"
-            )
-        if self.channel_stds.shape != (self._num_channels,):
-            raise ValueError(
-                f"channel_stds must have shape ({self._num_channels},), got {self.channel_stds.shape}"
-            )
-        self.channel_stds = np.maximum(self.channel_stds, self.normalization_eps)
+        self.n_original = len(self.labels)
+        self.num_classes = int(np.max(self.labels)) + 1
 
     def __len__(self) -> int:
-        return len(self.X)
+        # Each segment treated as independent sample
+        # NOTE: Changed to return original length only,
+        # since we are not using both segments anymore (to use it uncomment the else block in __getitem__) and double the length
+        return self.n_original
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        # Get signal and normalize
-        signal = self.X[idx, :, :].astype(np.float32)  # (time_steps, num_channels)
-        signal = (signal - self.channel_means) / self.channel_stds
-        label = int(self.y[idx])
+        if idx < self.n_original:
+            # First half: segment_a samples
+            # copy=True to create writable array from read-only memory-mapped source
+            signal = np.array(self.segment_a[idx], dtype=np.float32, copy=True)
+            label = int(self.labels[idx])
+        # else:
+        #     # Second half: segment_b samples
+        #     original_idx = idx - self.n_original
+        #     signal = np.array(self.segment_b[original_idx], dtype=np.float32, copy=True)
+        #     label = int(self.labels[original_idx])
 
-        signal_tensor = torch.tensor(signal, dtype=torch.float32)
+        signal_tensor = torch.from_numpy(signal).float()
         return signal_tensor, label
