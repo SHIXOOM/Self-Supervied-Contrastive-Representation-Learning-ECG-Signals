@@ -1,5 +1,5 @@
 # Self-Supervied Contrastive Representation Learning ECG Signals
-
+![alt text](https://github.com/SHIXOOM/Self-Supervised-Representation-Learning-on-ECG-Signals-via-Dual-View-Transformers/blob/main/ML4H_Poster_Presentation.pptx.jpg)
 ## How to run (Bash for Linux & Mac)
 
 ```bash
@@ -44,8 +44,9 @@ If you want to kill a training run early:
 kill -9 $(pgrep -f single_gpu_training)
 ```
 
-Please note that the project is made to run on Nvidia's GPUs and CUDA.
+This pipeline is created to run on an Nvidia GPU. And was ran on Nvidia GB10 (DGX Spark) using about 110GB of VRAM on a batch size of 100.
 
+You can read a detailed report of this project [here](https://github.com/SHIXOOM/Self-Supervised-Representation-Learning-on-ECG-Signals-via-Dual-View-Transformers/blob/main/ML4H_Paper-4.pdf)
 
 References:
 ```
