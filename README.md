@@ -28,7 +28,7 @@ python preprocessing/reprocessing.py
 ```
 
 
-To start training on a single GPU:
+To start training on a single GPU and track the process with TensorBoard:
 
 ```bash
 cd ../ # Go back to the root dir, however you want to do it.
