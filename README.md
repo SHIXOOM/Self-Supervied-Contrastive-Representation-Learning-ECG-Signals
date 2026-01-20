@@ -45,3 +45,12 @@ kill -9 $(pgrep -f single_gpu_training)
 ```
 
 Please note that the project is made to run on Nvidia's GPUs and CUDA.
+
+
+References:
+```
+1. Oh, J., Chung, H., Kwon, J. M., Hong, D. G., & Choi, E. (2022, April). Lead-agnostic self-supervised learning for local and global representations of electrocardiogram. In Conference on Health, Inference, and Learning (pp. 338-353). PMLR.
+2. McKeen, K., Masood, S., Toma, A., Rubin, B., & Wang, B. (2025). Ecg-fm: An open electrocardiogram foundation model. JAMIA open, 8(5), ooaf122.
+3. Kiyasseh, D., Zhu, T., & Clifton, D. A. (2021, July). Clocs: Contrastive learning of cardiac signals across space, time, and patients. In International Conference on Machine Learning (pp. 5606-5615). PMLR.
+4. Chen, T., Kornblith, S., Norouzi, M., & Hinton, G. (2020, November). A simple framework for contrastive learning of visual representations. In International conference on machine learning (pp. 1597-1607). PmLR.
+```
